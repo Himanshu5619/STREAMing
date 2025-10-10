@@ -276,16 +276,14 @@ metadata:
 
 test_plan:
   current_focus:
-    - "User Authentication (JWT)"
-    - "Video Library Management"
-    - "Watch Room Creation and Management"
     - "WebSocket Real-time Synchronization"
-    - "Chat System"
-    - "Watchlist Management"
-  stuck_tasks: []
-  test_all: true
-  test_priority: "high_first"
+  stuck_tasks:
+    - "WebSocket Real-time Synchronization"
+  test_all: false
+  test_priority: "stuck_first"
 
 agent_communication:
   - agent: "main"
     message: "Initial implementation complete. Created full-stack streaming platform with watch together feature. Backend includes JWT auth, video management, room system, WebSocket for real-time sync, and chat. Frontend has auth UI, video browsing, synchronized video player, real-time chat, and user presence. Database seeded with 6 sample videos. All backend APIs need testing - focus on auth flow first, then video/room CRUD, and finally WebSocket real-time features."
+  - agent: "testing"
+    message: "Backend testing completed. 12/13 tests passed. All HTTP APIs working perfectly: Auth (JWT), Video Management, Room CRUD, Watchlist, and Chat message retrieval. WebSocket connection failing due to Kubernetes ingress configuration - needs WebSocket upgrade headers configured in ingress controller. This is an infrastructure issue, not a code problem."
