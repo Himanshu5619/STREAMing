@@ -82,12 +82,18 @@ class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     username: str
     email: str
+    avatar_color: str = "#EF4444"  # Default red
+    bio: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(BaseModel):
     username: str
     email: str
     password: str
+
+class UserUpdate(BaseModel):
+    avatar_color: Optional[str] = None
+    bio: Optional[str] = None
 
 class UserLogin(BaseModel):
     username: str
@@ -116,6 +122,9 @@ class Room(BaseModel):
     video_id: str
     host_id: str
     host_username: str
+    members: List[str] = []  # List of user IDs
+    max_members: int = 10
+    is_private: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
     current_time: float = 0.0
@@ -124,6 +133,16 @@ class Room(BaseModel):
 class RoomCreate(BaseModel):
     name: str
     video_id: str
+    max_members: int = 10
+    is_private: bool = False
+
+class RoomUpdate(BaseModel):
+    name: Optional[str] = None
+    max_members: Optional[int] = None
+    is_private: Optional[bool] = None
+
+class RoomInvite(BaseModel):
+    user_ids: List[str]
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -140,6 +159,28 @@ class Watchlist(BaseModel):
     user_id: str
     video_id: str
     added_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class WatchHistory(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    video_id: str
+    video_title: str
+    watched_duration: int  # seconds
+    last_position: float = 0.0  # Last watched position
+    watched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class WatchHistoryCreate(BaseModel):
+    video_id: str
+    video_title: str
+    watched_duration: int
+    last_position: float = 0.0
+
+class UserStats(BaseModel):
+    total_watch_time: int  # Total seconds watched
+    videos_watched: int
+    rooms_created: int
+    rooms_joined: int
 
 # Helper Functions
 def hash_password(password: str) -> str:
@@ -223,6 +264,40 @@ async def login(user_data: UserLogin):
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+@api_router.put("/auth/profile", response_model=User)
+async def update_profile(update_data: UserUpdate, current_user: User = Depends(get_current_user)):
+    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
+    
+    if update_dict:
+        await db.users.update_one({"id": current_user.id}, {"$set": update_dict})
+    
+    updated_user = await db.users.find_one({"id": current_user.id}, {"_id": 0})
+    if isinstance(updated_user['created_at'], str):
+        updated_user['created_at'] = datetime.fromisoformat(updated_user['created_at'])
+    
+    return User(**updated_user)
+
+# User Stats
+@api_router.get("/users/stats", response_model=UserStats)
+async def get_user_stats(current_user: User = Depends(get_current_user)):
+    # Total watch time
+    watch_history = await db.watch_history.find({"user_id": current_user.id}, {"_id": 0}).to_list(10000)
+    total_watch_time = sum([w['watched_duration'] for w in watch_history])
+    videos_watched = len(set([w['video_id'] for w in watch_history]))
+    
+    # Rooms created
+    rooms_created = await db.rooms.count_documents({"host_id": current_user.id})
+    
+    # Rooms joined (from watch history in rooms)
+    rooms_joined = await db.rooms.count_documents({"members": current_user.id})
+    
+    return UserStats(
+        total_watch_time=total_watch_time,
+        videos_watched=videos_watched,
+        rooms_created=rooms_created,
+        rooms_joined=rooms_joined
+    )
+
 # Video Routes
 @api_router.get("/videos", response_model=List[Video])
 async def get_videos():
@@ -253,7 +328,10 @@ async def create_room(room_data: RoomCreate, current_user: User = Depends(get_cu
         name=room_data.name,
         video_id=room_data.video_id,
         host_id=current_user.id,
-        host_username=current_user.username
+        host_username=current_user.username,
+        members=[current_user.id],
+        max_members=room_data.max_members,
+        is_private=room_data.is_private
     )
     
     room_dict = room.model_dump()
@@ -265,7 +343,18 @@ async def create_room(room_data: RoomCreate, current_user: User = Depends(get_cu
 
 @api_router.get("/rooms", response_model=List[Room])
 async def get_rooms(current_user: User = Depends(get_current_user)):
-    rooms = await db.rooms.find({"is_active": True}, {"_id": 0}).to_list(1000)
+    rooms = await db.rooms.find({"is_active": True, "is_private": False}, {"_id": 0}).to_list(1000)
+    for room in rooms:
+        if isinstance(room['created_at'], str):
+            room['created_at'] = datetime.fromisoformat(room['created_at'])
+    return rooms
+
+@api_router.get("/rooms/my", response_model=List[Room])
+async def get_my_rooms(current_user: User = Depends(get_current_user)):
+    rooms = await db.rooms.find(
+        {"$or": [{"host_id": current_user.id}, {"members": current_user.id}], "is_active": True},
+        {"_id": 0}
+    ).to_list(1000)
     for room in rooms:
         if isinstance(room['created_at'], str):
             room['created_at'] = datetime.fromisoformat(room['created_at'])
@@ -279,6 +368,77 @@ async def get_room(room_id: str, current_user: User = Depends(get_current_user))
     if isinstance(room['created_at'], str):
         room['created_at'] = datetime.fromisoformat(room['created_at'])
     return Room(**room)
+
+@api_router.put("/rooms/{room_id}", response_model=Room)
+async def update_room(room_id: str, update_data: RoomUpdate, current_user: User = Depends(get_current_user)):
+    room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room['host_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the host can update the room")
+    
+    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
+    
+    if update_dict:
+        await db.rooms.update_one({"id": room_id}, {"$set": update_dict})
+    
+    updated_room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if isinstance(updated_room['created_at'], str):
+        updated_room['created_at'] = datetime.fromisoformat(updated_room['created_at'])
+    
+    return Room(**updated_room)
+
+@api_router.post("/rooms/{room_id}/join")
+async def join_room(room_id: str, current_user: User = Depends(get_current_user)):
+    room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    if current_user.id in room.get('members', []):
+        return {"message": "Already in room"}
+    
+    if len(room.get('members', [])) >= room.get('max_members', 10):
+        raise HTTPException(status_code=400, detail="Room is full")
+    
+    await db.rooms.update_one({"id": room_id}, {"$push": {"members": current_user.id}})
+    
+    return {"message": "Joined room successfully"}
+
+@api_router.post("/rooms/{room_id}/leave")
+async def leave_room(room_id: str, current_user: User = Depends(get_current_user)):
+    room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    await db.rooms.update_one({"id": room_id}, {"$pull": {"members": current_user.id}})
+    
+    return {"message": "Left room successfully"}
+
+@api_router.post("/rooms/{room_id}/invite")
+async def invite_to_room(room_id: str, invite_data: RoomInvite, current_user: User = Depends(get_current_user)):
+    room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room['host_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the host can invite users")
+    
+    for user_id in invite_data.user_ids:
+        if user_id not in room.get('members', []):
+            await db.rooms.update_one({"id": room_id}, {"$push": {"members": user_id}})
+    
+    return {"message": "Users invited successfully"}
+
+@api_router.delete("/rooms/{room_id}/members/{user_id}")
+async def remove_member(room_id: str, user_id: str, current_user: User = Depends(get_current_user)):
+    room = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room['host_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the host can remove members")
+    
+    await db.rooms.update_one({"id": room_id}, {"$pull": {"members": user_id}})
+    
+    return {"message": "Member removed successfully"}
 
 @api_router.delete("/rooms/{room_id}")
 async def delete_room(room_id: str, current_user: User = Depends(get_current_user)):
@@ -322,6 +482,55 @@ async def get_watchlist(current_user: User = Depends(get_current_user)):
             video['created_at'] = datetime.fromisoformat(video['created_at'])
     return videos
 
+# Watch History Routes
+@api_router.post("/watch-history")
+async def add_watch_history(history_data: WatchHistoryCreate, current_user: User = Depends(get_current_user)):
+    # Update or create watch history
+    existing = await db.watch_history.find_one(
+        {"user_id": current_user.id, "video_id": history_data.video_id},
+        {"_id": 0}
+    )
+    
+    if existing:
+        # Update existing record
+        await db.watch_history.update_one(
+            {"user_id": current_user.id, "video_id": history_data.video_id},
+            {
+                "$set": {
+                    "watched_duration": history_data.watched_duration,
+                    "last_position": history_data.last_position,
+                    "watched_at": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        )
+    else:
+        # Create new record
+        watch_history = WatchHistory(
+            user_id=current_user.id,
+            video_id=history_data.video_id,
+            video_title=history_data.video_title,
+            watched_duration=history_data.watched_duration,
+            last_position=history_data.last_position
+        )
+        history_dict = watch_history.model_dump()
+        history_dict['watched_at'] = history_dict['watched_at'].isoformat()
+        await db.watch_history.insert_one(history_dict)
+    
+    return {"message": "Watch history updated"}
+
+@api_router.get("/watch-history", response_model=List[WatchHistory])
+async def get_watch_history(current_user: User = Depends(get_current_user)):
+    history = await db.watch_history.find(
+        {"user_id": current_user.id},
+        {"_id": 0}
+    ).sort("watched_at", -1).to_list(1000)
+    
+    for item in history:
+        if isinstance(item['watched_at'], str):
+            item['watched_at'] = datetime.fromisoformat(item['watched_at'])
+    
+    return history
+
 # Chat Routes
 @api_router.get("/rooms/{room_id}/messages", response_model=List[ChatMessage])
 async def get_chat_messages(room_id: str, current_user: User = Depends(get_current_user)):
@@ -330,6 +539,16 @@ async def get_chat_messages(room_id: str, current_user: User = Depends(get_curre
         if isinstance(msg['timestamp'], str):
             msg['timestamp'] = datetime.fromisoformat(msg['timestamp'])
     return messages
+
+# Search Users
+@api_router.get("/users/search")
+async def search_users(q: str, current_user: User = Depends(get_current_user)):
+    users = await db.users.find(
+        {"username": {"$regex": q, "$options": "i"}},
+        {"_id": 0, "password": 0}
+    ).limit(10).to_list(10)
+    
+    return [{"id": u["id"], "username": u["username"], "avatar_color": u.get("avatar_color", "#EF4444")} for u in users]
 
 # WebSocket Route
 @app.websocket("/ws/{room_id}")
